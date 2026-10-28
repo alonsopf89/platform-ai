@@ -12,16 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# A workflow that publishes the library to CocoaPods
-name: Publish
+# Workflow to publish NPM packages via Google OSS Exit Gate when a GitHub release is published
+name: Publish to NPM
 
 on:
-  workflow_call: # called when release-please steps.release.outputs.release_created
-  workflow_dispatch: # manually trigger if previous runs failed
+  release:
+    types: [published]
+  workflow_dispatch: # manual trigger for testing
 
 concurrency:
   group: publishing
   cancel-in-progress: true
+
+permissions: {}
 
 jobs:
   build-and-test:
@@ -30,38 +33,66 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     needs: build-and-test
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
 
       # 1. Setup Node using the default registry (npmjs.org)
       - name: Setup Node (Default Registry)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 20
 
       # Setup Bun (required by the package's build/prepack scripts)
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v1
+        uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76
 
       # 2. Install Dependencies from the default registry
       - name: Install Dependencies
         run: npm install --workspace=packages/code-assist
 
-      # 3. Setup Node again, configuring the WDR registry for publishing
-      - name: Setup Node for Publishing (WDR Registry)
-        uses: actions/setup-node@v4
+      # 3. Authenticate to Google Cloud via Workload Identity Federation
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed
         with:
-          node-version: 20
-          registry-url: "https://wombat-dressing-room.appspot.com/"
+          workload_identity_provider: 'projects/305452601764/locations/global/workloadIdentityPools/builders/providers/github'
 
-      # 4. Publish to WDR
-      - name: Publish
-        # npm publish will trigger the build via the prepack hook
-        run: npm publish --workspace=packages/code-assist
-        env:
-          # The NODE_AUTH_TOKEN is used to authenticate against the Wombat Dressing Room registry.
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_WOMBOT_TOKEN }}
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f
+
+      # 4. Stage to OSS Exit Gate Artifact Registry and trigger release
+      - name: Publish via OSS Exit Gate
+        run: |
+          set -euo pipefail
+          cat << 'EOF' > .npmrc
+          registry=https://us-npm.pkg.dev/oss-exit-gate-prod/platform-ai--npm/
+          //us-npm.pkg.dev/oss-exit-gate-prod/platform-ai--npm/:always-auth=true
+          EOF
+          npx --yes google-artifactregistry-auth --repo-config=.npmrc --credential-config="$HOME/.npmrc"
+          npm publish --workspace=packages/code-assist --registry="https://us-npm.pkg.dev/oss-exit-gate-prod/platform-ai--npm/" --provenance=false
+          PKG_VER="$(node -p "require('./packages/code-assist/package.json').version")"
+          cat << EOF > manifest.json
+          {
+            "publish_all": false,
+            "publishing_groups": [
+              {
+                "packages": [
+                  {
+                    "name": "@googlemaps/code-assist-mcp",
+                    "version": "${PKG_VER}"
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+          gcloud storage cp manifest.json \
+            "gs://oss-exit-gate-prod-projects-bucket/platform-ai/npm/manifests/manifest-${{ github.run_id }}-${{ github.run_attempt }}.json"
 
   # Publish to MCP Registry after successful NPM publishing
   publish-mcp:
